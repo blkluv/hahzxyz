@@ -11,7 +11,8 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      "@": resolve(__dirname, "./src"),
+      "@": resolve(__dirname, "./src"), // ✅ Alias for "@/..." paths
     },
+    extensions: [".js", ".ts", ".jsx", ".tsx", ".json"], // ✅ Optional, helps resolve TS/JS imports
   },
 });
