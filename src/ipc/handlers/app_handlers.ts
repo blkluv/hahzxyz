@@ -1,18 +1,19 @@
 import { ipcMain, app } from "electron";
 import { db, getDatabasePath } from "../../db";
-import { apps, chats } from "../../db/schema";
-import { desc, eq } from "drizzle-orm";
+import { apps, chats, messages } from "../../db/schema";
+import { desc, eq, like } from "drizzle-orm";
 import type {
   App,
   CreateAppParams,
   RenameBranchParams,
   CopyAppParams,
   EditAppFileReturnType,
+  RespondToAppInputParams,
 } from "../ipc_types";
 import fs from "node:fs";
 import path from "node:path";
 import { getDyadAppPath, getUserDataPath } from "../../paths/paths";
-import { spawn } from "node:child_process";
+import { ChildProcess, spawn } from "node:child_process";
 import git from "isomorphic-git";
 import { promises as fsPromises } from "node:fs";
 
@@ -22,8 +23,9 @@ import { getFilesRecursively } from "../utils/file_utils";
 import {
   runningApps,
   processCounter,
-  killProcess,
   removeAppIfCurrentProcess,
+  stopAppByInfo,
+  removeDockerVolumesForApp,
 } from "../utils/process_manager";
 import { getEnvVar } from "../utils/read_env";
 import { readSettings } from "../../main/settings";
@@ -47,7 +49,11 @@ import { safeSend } from "../utils/safe_sender";
 import { normalizePath } from "../../../shared/normalizePath";
 import { isServerFunction } from "@/supabase_admin/supabase_utils";
 import { getVercelTeamSlug } from "../utils/vercel_utils";
+import { storeDbTimestampAtCurrentVersion } from "../utils/neon_timestamp_utils";
+import { AppSearchResult } from "@/lib/schemas";
 
+const DEFAULT_COMMAND =
+  "(pnpm install && pnpm run dev --port 32100) || (npm install --legacy-peer-deps && npm run dev -- --port 32100)";
 async function copyDir(
   source: string,
   destination: string,
@@ -80,35 +86,322 @@ async function executeApp({
   appPath,
   appId,
   event, // Keep event for local-node case
+  isNeon,
+  installCommand,
+  startCommand,
 }: {
   appPath: string;
   appId: number;
   event: Electron.IpcMainInvokeEvent;
+  isNeon: boolean;
+  installCommand?: string | null;
+  startCommand?: string | null;
 }): Promise<void> {
   if (proxyWorker) {
     proxyWorker.terminate();
     proxyWorker = null;
   }
-  await executeAppLocalNode({ appPath, appId, event });
+  const settings = readSettings();
+  const runtimeMode = settings.runtimeMode2 ?? "host";
+
+  if (runtimeMode === "docker") {
+    await executeAppInDocker({
+      appPath,
+      appId,
+      event,
+      isNeon,
+      installCommand,
+      startCommand,
+    });
+  } else {
+    await executeAppLocalNode({
+      appPath,
+      appId,
+      event,
+      isNeon,
+      installCommand,
+      startCommand,
+    });
+  }
 }
 
 async function executeAppLocalNode({
   appPath,
   appId,
   event,
+  isNeon,
+  installCommand,
+  startCommand,
 }: {
   appPath: string;
   appId: number;
   event: Electron.IpcMainInvokeEvent;
+  isNeon: boolean;
+  installCommand?: string | null;
+  startCommand?: string | null;
 }): Promise<void> {
-  const process = spawn(
-    "(pnpm install && pnpm run dev --port 32100) || (npm install --legacy-peer-deps && npm run dev -- --port 32100)",
-    [],
+  const command = getCommand({ installCommand, startCommand });
+  const spawnedProcess = spawn(command, [], {
+    cwd: appPath,
+    shell: true,
+    stdio: "pipe", // Ensure stdio is piped so we can capture output/errors and detect close
+    detached: false, // Ensure child process is attached to the main process lifecycle unless explicitly backgrounded
+  });
+
+  // Check if process spawned correctly
+  if (!spawnedProcess.pid) {
+    // Attempt to capture any immediate errors if possible
+    let errorOutput = "";
+    spawnedProcess.stderr?.on("data", (data) => (errorOutput += data));
+    await new Promise((resolve) => spawnedProcess.on("error", resolve)); // Wait for error event
+    throw new Error(
+      `Failed to spawn process for app ${appId}. Error: ${
+        errorOutput || "Unknown spawn error"
+      }`,
+    );
+  }
+
+  // Increment the counter and store the process reference with its ID
+  const currentProcessId = processCounter.increment();
+  runningApps.set(appId, {
+    process: spawnedProcess,
+    processId: currentProcessId,
+    isDocker: false,
+  });
+
+  listenToProcess({
+    process: spawnedProcess,
+    appId,
+    isNeon,
+    event,
+  });
+}
+
+function listenToProcess({
+  process: spawnedProcess,
+  appId,
+  isNeon,
+  event,
+}: {
+  process: ChildProcess;
+  appId: number;
+  isNeon: boolean;
+  event: Electron.IpcMainInvokeEvent;
+}) {
+  // Log output
+  spawnedProcess.stdout?.on("data", async (data) => {
+    const message = util.stripVTControlCharacters(data.toString());
+    logger.debug(
+      `App ${appId} (PID: ${spawnedProcess.pid}) stdout: ${message}`,
+    );
+
+    // This is a hacky heuristic to pick up when drizzle is asking for user
+    // to select from one of a few choices. We automatically pick the first
+    // option because it's usually a good default choice. We guard this with
+    // isNeon because: 1) only Neon apps (for the official Dyad templates) should
+    // get this template and 2) it's safer to do this with Neon apps because
+    // their databases have point in time restore built-in.
+    if (isNeon && message.includes("created or renamed from another")) {
+      spawnedProcess.stdin?.write(`\r\n`);
+      logger.info(
+        `App ${appId} (PID: ${spawnedProcess.pid}) wrote enter to stdin to automatically respond to drizzle push input`,
+      );
+    }
+
+    // Check if this is an interactive prompt requiring user input
+    const inputRequestPattern = /\s*›\s*\([yY]\/[nN]\)\s*$/;
+    const isInputRequest = inputRequestPattern.test(message);
+    if (isInputRequest) {
+      // Send special input-requested event for interactive prompts
+      safeSend(event.sender, "app:output", {
+        type: "input-requested",
+        message,
+        appId,
+      });
+    } else {
+      // Normal stdout handling
+      safeSend(event.sender, "app:output", {
+        type: "stdout",
+        message,
+        appId,
+      });
+
+      const urlMatch = message.match(/(https?:\/\/localhost:\d+\/?)/);
+      if (urlMatch) {
+        proxyWorker = await startProxy(urlMatch[1], {
+          onStarted: (proxyUrl) => {
+            safeSend(event.sender, "app:output", {
+              type: "stdout",
+              message: `[dyad-proxy-server]started=[${proxyUrl}] original=[${urlMatch[1]}]`,
+              appId,
+            });
+          },
+        });
+      }
+    }
+  });
+
+  spawnedProcess.stderr?.on("data", (data) => {
+    const message = util.stripVTControlCharacters(data.toString());
+    logger.error(
+      `App ${appId} (PID: ${spawnedProcess.pid}) stderr: ${message}`,
+    );
+    safeSend(event.sender, "app:output", {
+      type: "stderr",
+      message,
+      appId,
+    });
+  });
+
+  // Handle process exit/close
+  spawnedProcess.on("close", (code, signal) => {
+    logger.log(
+      `App ${appId} (PID: ${spawnedProcess.pid}) process closed with code ${code}, signal ${signal}.`,
+    );
+    removeAppIfCurrentProcess(appId, spawnedProcess);
+  });
+
+  // Handle errors during process lifecycle (e.g., command not found)
+  spawnedProcess.on("error", (err) => {
+    logger.error(
+      `Error in app ${appId} (PID: ${spawnedProcess.pid}) process: ${err.message}`,
+    );
+    removeAppIfCurrentProcess(appId, spawnedProcess);
+    // Note: We don't throw here as the error is asynchronous. The caller got a success response already.
+    // Consider adding ipcRenderer event emission to notify UI of the error.
+  });
+}
+
+async function executeAppInDocker({
+  appPath,
+  appId,
+  event,
+  isNeon,
+  installCommand,
+  startCommand,
+}: {
+  appPath: string;
+  appId: number;
+  event: Electron.IpcMainInvokeEvent;
+  isNeon: boolean;
+  installCommand?: string | null;
+  startCommand?: string | null;
+}): Promise<void> {
+  const containerName = `dyad-app-${appId}`;
+
+  // First, check if Docker is available
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const checkDocker = spawn("docker", ["--version"], { stdio: "pipe" });
+      checkDocker.on("close", (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error("Docker is not available"));
+        }
+      });
+      checkDocker.on("error", () => {
+        reject(new Error("Docker is not available"));
+      });
+    });
+  } catch {
+    throw new Error(
+      "Docker is required but not available. Please install Docker Desktop and ensure it's running.",
+    );
+  }
+
+  // Stop and remove any existing container with the same name
+  try {
+    await new Promise<void>((resolve) => {
+      const stopContainer = spawn("docker", ["stop", containerName], {
+        stdio: "pipe",
+      });
+      stopContainer.on("close", () => {
+        const removeContainer = spawn("docker", ["rm", containerName], {
+          stdio: "pipe",
+        });
+        removeContainer.on("close", () => resolve());
+        removeContainer.on("error", () => resolve()); // Container might not exist
+      });
+      stopContainer.on("error", () => resolve()); // Container might not exist
+    });
+  } catch (error) {
+    logger.info(
+      `Docker container ${containerName} not found. Ignoring error: ${error}`,
+    );
+  }
+
+  // Create a Dockerfile in the app directory if it doesn't exist
+  const dockerfilePath = path.join(appPath, "Dockerfile.dyad");
+  if (!fs.existsSync(dockerfilePath)) {
+    const dockerfileContent = `FROM node:22-alpine
+
+# Install pnpm
+RUN npm install -g pnpm
+`;
+
+    try {
+      await fsPromises.writeFile(dockerfilePath, dockerfileContent, "utf-8");
+    } catch (error) {
+      logger.error(`Failed to create Dockerfile for app ${appId}:`, error);
+      throw new Error(`Failed to create Dockerfile: ${error}`);
+    }
+  }
+
+  // Build the Docker image
+  const buildProcess = spawn(
+    "docker",
+    ["build", "-f", "Dockerfile.dyad", "-t", `dyad-app-${appId}`, "."],
     {
       cwd: appPath,
-      shell: true,
-      stdio: "pipe", // Ensure stdio is piped so we can capture output/errors and detect close
-      detached: false, // Ensure child process is attached to the main process lifecycle unless explicitly backgrounded
+      stdio: "pipe",
+    },
+  );
+
+  let buildError = "";
+  buildProcess.stderr?.on("data", (data) => {
+    buildError += data.toString();
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    buildProcess.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`Docker build failed: ${buildError}`));
+      }
+    });
+    buildProcess.on("error", (err) => {
+      reject(new Error(`Docker build process error: ${err.message}`));
+    });
+  });
+
+  // Run the Docker container
+  const process = spawn(
+    "docker",
+    [
+      "run",
+      "--rm",
+      "--name",
+      containerName,
+      "-p",
+      "32100:32100",
+      "-v",
+      `${appPath}:/app`,
+      "-v",
+      `dyad-pnpm-${appId}:/app/.pnpm-store`,
+      "-e",
+      "PNPM_STORE_PATH=/app/.pnpm-store",
+      "-w",
+      "/app",
+      `dyad-app-${appId}`,
+      "sh",
+      "-c",
+      getCommand({ installCommand, startCommand }),
+    ],
+    {
+      stdio: "pipe",
+      detached: false,
     },
   );
 
@@ -119,7 +412,7 @@ async function executeAppLocalNode({
     process.stderr?.on("data", (data) => (errorOutput += data));
     await new Promise((resolve) => process.on("error", resolve)); // Wait for error event
     throw new Error(
-      `Failed to spawn process for app ${appId}. Error: ${
+      `Failed to spawn Docker container for app ${appId}. Error: ${
         errorOutput || "Unknown spawn error"
       }`,
     );
@@ -127,58 +420,18 @@ async function executeAppLocalNode({
 
   // Increment the counter and store the process reference with its ID
   const currentProcessId = processCounter.increment();
-  runningApps.set(appId, { process, processId: currentProcessId });
-
-  // Log output
-  process.stdout?.on("data", async (data) => {
-    const message = util.stripVTControlCharacters(data.toString());
-    logger.debug(`App ${appId} (PID: ${process.pid}) stdout: ${message}`);
-
-    safeSend(event.sender, "app:output", {
-      type: "stdout",
-      message,
-      appId,
-    });
-    const urlMatch = message.match(/(https?:\/\/localhost:\d+\/?)/);
-    if (urlMatch) {
-      proxyWorker = await startProxy(urlMatch[1], {
-        onStarted: (proxyUrl) => {
-          safeSend(event.sender, "app:output", {
-            type: "stdout",
-            message: `[dyad-proxy-server]started=[${proxyUrl}] original=[${urlMatch[1]}]`,
-            appId,
-          });
-        },
-      });
-    }
+  runningApps.set(appId, {
+    process,
+    processId: currentProcessId,
+    isDocker: true,
+    containerName,
   });
 
-  process.stderr?.on("data", (data) => {
-    const message = util.stripVTControlCharacters(data.toString());
-    logger.error(`App ${appId} (PID: ${process.pid}) stderr: ${message}`);
-    safeSend(event.sender, "app:output", {
-      type: "stderr",
-      message,
-      appId,
-    });
-  });
-
-  // Handle process exit/close
-  process.on("close", (code, signal) => {
-    logger.log(
-      `App ${appId} (PID: ${process.pid}) process closed with code ${code}, signal ${signal}.`,
-    );
-    removeAppIfCurrentProcess(appId, process);
-  });
-
-  // Handle errors during process lifecycle (e.g., command not found)
-  process.on("error", (err) => {
-    logger.error(
-      `Error in app ${appId} (PID: ${process.pid}) process: ${err.message}`,
-    );
-    removeAppIfCurrentProcess(appId, process);
-    // Note: We don't throw here as the error is asynchronous. The caller got a success response already.
-    // Consider adding ipcRenderer event emission to notify UI of the error.
+  listenToProcess({
+    process,
+    appId,
+    isNeon,
+    event,
   });
 }
 
@@ -188,6 +441,49 @@ async function killProcessOnPort(port: number): Promise<void> {
     await killPort(port, "tcp");
   } catch {
     // Ignore if nothing was running on that port
+  }
+}
+
+// Helper to stop any Docker containers publishing a given host port
+async function stopDockerContainersOnPort(port: number): Promise<void> {
+  try {
+    // List container IDs that publish the given port
+    const list = spawn("docker", ["ps", "--filter", `publish=${port}`, "-q"], {
+      stdio: "pipe",
+    });
+
+    let stdout = "";
+    list.stdout?.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    await new Promise<void>((resolve) => {
+      list.on("close", () => resolve());
+      list.on("error", () => resolve());
+    });
+
+    const containerIds = stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (containerIds.length === 0) {
+      return;
+    }
+
+    // Stop each container best-effort
+    await Promise.all(
+      containerIds.map(
+        (id) =>
+          new Promise<void>((resolve) => {
+            const stop = spawn("docker", ["stop", id], { stdio: "pipe" });
+            stop.on("close", () => resolve());
+            stop.on("error", () => resolve());
+          }),
+      ),
+    );
+  } catch (e) {
+    logger.warn(`Failed stopping Docker containers on port ${port}: ${e}`);
   }
 }
 
@@ -335,6 +631,8 @@ export function registerAppHandlers() {
           supabaseProjectId: null,
           githubOrg: null,
           githubRepo: null,
+          installCommand: originalApp.installCommand,
+          startCommand: originalApp.startCommand,
         })
         .returning();
 
@@ -464,9 +762,16 @@ export function registerAppHandlers() {
 
         const appPath = getDyadAppPath(app.path);
         try {
-          // Kill any orphaned process on port 32100 (in case previous run left it)
-          await killProcessOnPort(32100);
-          await executeApp({ appPath, appId, event });
+          // There may have been a previous run that left a process on port 32100.
+          await cleanUpPort(32100);
+          await executeApp({
+            appPath,
+            appId,
+            event,
+            isNeon: !!app.neonProjectId,
+            installCommand: app.installCommand,
+            startCommand: app.startCommand,
+          });
 
           return;
         } catch (error: any) {
@@ -515,8 +820,7 @@ export function registerAppHandlers() {
         }
 
         try {
-          // Use the killProcess utility to stop the process
-          await killProcess(process);
+          await stopAppByInfo(appId, appInfo);
 
           // Now, safely remove the app from the map *after* confirming closure
           removeAppIfCurrentProcess(appId, process);
@@ -550,19 +854,17 @@ export function registerAppHandlers() {
           // First stop the app if it's running
           const appInfo = runningApps.get(appId);
           if (appInfo) {
-            const { process, processId } = appInfo;
+            const { processId } = appInfo;
             logger.log(
               `Stopping app ${appId} (processId ${processId}) before restart`,
             );
-
-            await killProcess(process);
-            runningApps.delete(appId);
+            await stopAppByInfo(appId, appInfo);
           } else {
             logger.log(`App ${appId} not running. Proceeding to start.`);
           }
 
-          // Kill any orphaned process on port 32100 (in case previous run left it)
-          await killProcessOnPort(32100);
+          // There may have been a previous run that left a process on port 32100.
+          await cleanUpPort(32100);
 
           // Now start the app again
           const app = await db.query.apps.findFirst({
@@ -577,6 +879,9 @@ export function registerAppHandlers() {
 
           // Remove node_modules if requested
           if (removeNodeModules) {
+            const settings = readSettings();
+            const runtimeMode = settings.runtimeMode2 ?? "host";
+
             const nodeModulesPath = path.join(appPath, "node_modules");
             logger.log(
               `Removing node_modules for app ${appId} at ${nodeModulesPath}`,
@@ -590,13 +895,38 @@ export function registerAppHandlers() {
             } else {
               logger.log(`No node_modules directory found for app ${appId}`);
             }
+
+            // If running in Docker mode, also remove container volumes so deps reinstall freshly
+            if (runtimeMode === "docker") {
+              logger.log(
+                `Docker mode detected for app ${appId}. Removing Docker volumes dyad-pnpm-${appId}...`,
+              );
+              try {
+                await removeDockerVolumesForApp(appId);
+                logger.log(
+                  `Removed Docker volumes for app ${appId} (dyad-pnpm-${appId}).`,
+                );
+              } catch (e) {
+                // Best-effort cleanup; log and continue
+                logger.warn(
+                  `Failed to remove Docker volumes for app ${appId}. Continuing: ${e}`,
+                );
+              }
+            }
           }
 
           logger.debug(
             `Executing app ${appId} in path ${app.path} after restart request`,
           ); // Adjusted log
 
-          await executeApp({ appPath, appId, event }); // This will handle starting either mode
+          await executeApp({
+            appPath,
+            appId,
+            event,
+            isNeon: !!app.neonProjectId,
+            installCommand: app.installCommand,
+            startCommand: app.startCommand,
+          }); // This will handle starting either mode
 
           return;
         } catch (error) {
@@ -631,6 +961,23 @@ export function registerAppHandlers() {
       // Check if the path is within the app directory (security check)
       if (!fullPath.startsWith(appPath)) {
         throw new Error("Invalid file path");
+      }
+
+      if (app.neonProjectId && app.neonDevelopmentBranchId) {
+        try {
+          await storeDbTimestampAtCurrentVersion({
+            appId: app.id,
+          });
+        } catch (error) {
+          logger.error(
+            "Error storing Neon timestamp at current version:",
+            error,
+          );
+          throw new Error(
+            "Could not store Neon timestamp at current version; database versioning functionality is not working: " +
+              error,
+          );
+        }
       }
 
       // Ensure directory exists
@@ -696,8 +1043,7 @@ export function registerAppHandlers() {
           const appInfo = runningApps.get(appId)!;
           try {
             logger.log(`Stopping app ${appId} before deletion.`); // Adjusted log
-            await killProcess(appInfo.process);
-            runningApps.delete(appId);
+            await stopAppByInfo(appId, appInfo);
           } catch (error: any) {
             logger.error(`Error stopping app ${appId} before deletion:`, error); // Adjusted log
             // Continue with deletion even if stopping fails
@@ -770,8 +1116,7 @@ export function registerAppHandlers() {
         if (runningApps.has(appId)) {
           const appInfo = runningApps.get(appId)!;
           try {
-            await killProcess(appInfo.process);
-            runningApps.delete(appId);
+            await stopAppByInfo(appId, appInfo);
           } catch (error: any) {
             logger.error(`Error stopping app ${appId} before renaming:`, error);
             throw new Error(
@@ -867,8 +1212,7 @@ export function registerAppHandlers() {
     for (const appId of runningAppIds) {
       try {
         const appInfo = runningApps.get(appId)!;
-        await killProcess(appInfo.process);
-        runningApps.delete(appId);
+        await stopAppByInfo(appId, appInfo);
       } catch (error) {
         logger.error(`Error stopping app ${appId} during reset:`, error);
         // Continue with reset even if stopping fails
@@ -968,4 +1312,140 @@ export function registerAppHandlers() {
       }
     });
   });
+
+  handle(
+    "respond-to-app-input",
+    async (_, { appId, response }: RespondToAppInputParams) => {
+      if (response !== "y" && response !== "n") {
+        throw new Error(`Invalid response: ${response}`);
+      }
+      const appInfo = runningApps.get(appId);
+
+      if (!appInfo) {
+        throw new Error(`App ${appId} is not running`);
+      }
+
+      const { process } = appInfo;
+
+      if (!process.stdin) {
+        throw new Error(`App ${appId} process has no stdin available`);
+      }
+
+      try {
+        // Write the response to stdin with a newline
+        process.stdin.write(`${response}\n`);
+        logger.debug(`Sent response '${response}' to app ${appId} stdin`);
+      } catch (error: any) {
+        logger.error(`Error sending response to app ${appId}:`, error);
+        throw new Error(`Failed to send response to app: ${error.message}`);
+      }
+    },
+  );
+
+  handle(
+    "search-app",
+    async (_, searchQuery: string): Promise<AppSearchResult[]> => {
+      // Use parameterized query to prevent SQL injection
+      const pattern = `%${searchQuery.replace(/[%_]/g, "\\$&")}%`;
+
+      // 1) Apps whose name matches
+      const appNameMatches = await db
+        .select({
+          id: apps.id,
+          name: apps.name,
+          createdAt: apps.createdAt,
+        })
+        .from(apps)
+        .where(like(apps.name, pattern))
+        .orderBy(desc(apps.createdAt));
+
+      const appNameMatchesResult: AppSearchResult[] = appNameMatches.map(
+        (r) => ({
+          id: r.id,
+          name: r.name,
+          createdAt: r.createdAt,
+          matchedChatTitle: null,
+          matchedChatMessage: null,
+        }),
+      );
+
+      // 2) Apps whose chat title matches
+      const chatTitleMatches = await db
+        .select({
+          id: apps.id,
+          name: apps.name,
+          createdAt: apps.createdAt,
+          matchedChatTitle: chats.title,
+        })
+        .from(apps)
+        .innerJoin(chats, eq(apps.id, chats.appId))
+        .where(like(chats.title, pattern))
+        .orderBy(desc(apps.createdAt));
+
+      const chatTitleMatchesResult: AppSearchResult[] = chatTitleMatches.map(
+        (r) => ({
+          id: r.id,
+          name: r.name,
+          createdAt: r.createdAt,
+          matchedChatTitle: r.matchedChatTitle,
+          matchedChatMessage: null,
+        }),
+      );
+
+      // 3) Apps whose chat message content matches
+      const chatMessageMatches = await db
+        .select({
+          id: apps.id,
+          name: apps.name,
+          createdAt: apps.createdAt,
+          matchedChatTitle: chats.title,
+          matchedChatMessage: messages.content,
+        })
+        .from(apps)
+        .innerJoin(chats, eq(apps.id, chats.appId))
+        .innerJoin(messages, eq(chats.id, messages.chatId))
+        .where(like(messages.content, pattern))
+        .orderBy(desc(apps.createdAt));
+
+      // Flatten and dedupe by app id
+      const allMatches: AppSearchResult[] = [
+        ...appNameMatchesResult,
+        ...chatTitleMatchesResult,
+        ...chatMessageMatches,
+      ];
+      const uniqueApps = Array.from(
+        new Map(allMatches.map((app) => [app.id, app])).values(),
+      );
+
+      // Sort newest apps first
+      uniqueApps.sort(
+        (a, b) =>
+          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      );
+
+      return uniqueApps;
+    },
+  );
+}
+
+function getCommand({
+  installCommand,
+  startCommand,
+}: {
+  installCommand?: string | null;
+  startCommand?: string | null;
+}) {
+  const hasCustomCommands = !!installCommand?.trim() && !!startCommand?.trim();
+  return hasCustomCommands
+    ? `${installCommand!.trim()} && ${startCommand!.trim()}`
+    : DEFAULT_COMMAND;
+}
+
+async function cleanUpPort(port: number) {
+  const settings = readSettings();
+  if (settings.runtimeMode2 === "docker") {
+    await stopDockerContainersOnPort(port);
+  } else {
+    await killProcessOnPort(port);
+  }
 }

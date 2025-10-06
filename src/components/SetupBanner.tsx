@@ -8,9 +8,11 @@ import {
   XCircle,
   Loader2,
   Settings,
+  GlobeIcon,
 } from "lucide-react";
 import { providerSettingsRoute } from "@/routes/settings/providers/$provider";
-import { settingsRoute } from "@/routes/settings";
+
+import SetupProviderCard from "@/components/SetupProviderCard";
 
 import { useState, useEffect, useCallback } from "react";
 import { IpcClient } from "@/ipc/ipc_client";
@@ -25,6 +27,10 @@ import { cn } from "@/lib/utils";
 import { NodeSystemInfo } from "@/ipc/ipc_types";
 import { usePostHog } from "posthog-js/react";
 import { useLanguageModelProviders } from "@/hooks/useLanguageModelProviders";
+import { useScrollAndNavigateTo } from "@/hooks/useScrollAndNavigateTo";
+// @ts-ignore
+import logo from "../../assets/logo.svg";
+
 type NodeInstallStep =
   | "install"
   | "waiting-for-continue"
@@ -58,7 +64,12 @@ export function SetupBanner() {
     checkNode();
   }, [checkNode]);
 
-  const handleAiSetupClick = () => {
+  const settingsScrollAndNavigateTo = useScrollAndNavigateTo("/settings", {
+    behavior: "smooth",
+    block: "start",
+  });
+
+  const handleGoogleSetupClick = () => {
     posthog.capture("setup-flow:ai-provider-setup:google:click");
     navigate({
       to: providerSettingsRoute.id,
@@ -66,11 +77,23 @@ export function SetupBanner() {
     });
   };
 
+  const handleOpenRouterSetupClick = () => {
+    posthog.capture("setup-flow:ai-provider-setup:openrouter:click");
+    navigate({
+      to: providerSettingsRoute.id,
+      params: { provider: "openrouter" },
+    });
+  };
+  const handleDyadProSetupClick = () => {
+    posthog.capture("setup-flow:ai-provider-setup:dyad:click");
+    IpcClient.getInstance().openExternalUrl(
+      "https://www.dyad.sh/pro?utm_source=dyad-app&utm_medium=app&utm_campaign=setup-banner",
+    );
+  };
+
   const handleOtherProvidersClick = () => {
     posthog.capture("setup-flow:ai-provider-setup:other:click");
-    navigate({
-      to: settingsRoute.id,
-    });
+    settingsScrollAndNavigateTo("provider-settings");
   };
 
   const handleNodeInstallClick = useCallback(async () => {
@@ -100,7 +123,7 @@ export function SetupBanner() {
 
   if (itemsNeedAction.length === 0) {
     return (
-      <h1 className="text-6xl font-bold mb-8 bg-clip-text text-transparent bg-gradient-to-r from-gray-900 to-gray-600 dark:from-gray-100 dark:to-gray-400 tracking-tight">
+      <h1 className="text-center text-5xl font-bold mb-8 bg-clip-text text-transparent bg-gradient-to-r from-gray-900 to-gray-600 dark:from-gray-100 dark:to-gray-400 tracking-tight">
         Build your dream app
       </h1>
     );
@@ -124,9 +147,7 @@ export function SetupBanner() {
 
   return (
     <>
-      <p className="text-xl text-zinc-700 dark:text-zinc-300 p-4">
-        Follow these steps and you'll be ready to start building with Dyad...
-      </p>
+      <p className="text-xl text-zinc-700 dark:text-zinc-300 p-4">Setup Dyad</p>
       <div className={bannerClasses}>
         <Accordion
           type="multiple"
@@ -226,30 +247,55 @@ export function SetupBanner() {
               <p className="text-sm mb-3">
                 Connect your preferred AI provider to start generating code.
               </p>
-              <div
-                className="p-3 bg-blue-50 dark:bg-blue-900/50 border border-blue-200 dark:border-blue-700 rounded-lg cursor-pointer hover:bg-blue-100 dark:hover:bg-blue-900/70 transition-colors"
-                onClick={handleAiSetupClick}
-                role="button"
+              <SetupProviderCard
+                variant="google"
+                onClick={handleGoogleSetupClick}
                 tabIndex={isNodeSetupComplete ? 0 : -1}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-2">
-                    <div className="bg-blue-100 dark:bg-blue-800 p-1.5 rounded-full">
-                      <Sparkles className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                    </div>
-                    <div>
-                      <h4 className="font-medium text-sm text-blue-800 dark:text-blue-300">
-                        Setup Google Gemini API Key
-                      </h4>
-                      <p className="text-xs text-blue-600 dark:text-blue-400 flex items-center gap-1">
-                        <GiftIcon className="w-3 h-3" />
-                        Use Google Gemini for free
-                      </p>
-                    </div>
-                  </div>
-                  <ChevronRight className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                </div>
-              </div>
+                leadingIcon={
+                  <Sparkles className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                }
+                title="Setup Google Gemini API Key"
+                subtitle={
+                  <>
+                    <GiftIcon className="w-3 h-3" />
+                    Use Google Gemini for free
+                  </>
+                }
+              />
+
+              <SetupProviderCard
+                className="mt-2"
+                variant="openrouter"
+                onClick={handleOpenRouterSetupClick}
+                tabIndex={isNodeSetupComplete ? 0 : -1}
+                leadingIcon={
+                  <Sparkles className="w-4 h-4 text-teal-600 dark:text-teal-400" />
+                }
+                title="Setup OpenRouter API Key"
+                subtitle={
+                  <>
+                    <GiftIcon className="w-3 h-3" />
+                    Free models available
+                  </>
+                }
+              />
+
+              <SetupProviderCard
+                className="mt-2"
+                variant="dyad"
+                onClick={handleDyadProSetupClick}
+                tabIndex={isNodeSetupComplete ? 0 : -1}
+                leadingIcon={
+                  <img src={logo} alt="Dyad Logo" className="w-6 h-6 mr-0.5" />
+                }
+                title="Setup Dyad Pro"
+                subtitle={
+                  <>
+                    <GlobeIcon className="w-3 h-3" />
+                    Access all AI models with one plan
+                  </>
+                }
+              />
 
               <div
                 className="mt-2 p-3 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-lg cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-800/70 transition-colors"
@@ -350,3 +396,36 @@ function NodeInstallButton({
       const _exhaustiveCheck: never = nodeInstallStep;
   }
 }
+
+export const OpenRouterSetupBanner = ({
+  className,
+}: {
+  className?: string;
+}) => {
+  const posthog = usePostHog();
+  const navigate = useNavigate();
+  return (
+    <SetupProviderCard
+      className={cn("mt-2", className)}
+      variant="openrouter"
+      onClick={() => {
+        posthog.capture("setup-flow:ai-provider-setup:openrouter:click");
+        navigate({
+          to: providerSettingsRoute.id,
+          params: { provider: "openrouter" },
+        });
+      }}
+      tabIndex={0}
+      leadingIcon={
+        <Sparkles className="w-4 h-4 text-purple-600 dark:text-purple-400" />
+      }
+      title="Setup OpenRouter API Key"
+      subtitle={
+        <>
+          <GiftIcon className="w-3 h-3" />
+          Free models available
+        </>
+      }
+    />
+  );
+};

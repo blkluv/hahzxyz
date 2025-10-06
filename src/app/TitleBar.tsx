@@ -5,7 +5,7 @@ import { useRouter, useLocation } from "@tanstack/react-router";
 import { useSettings } from "@/hooks/useSettings";
 import { Button } from "@/components/ui/button";
 // @ts-ignore
-import logo from "../../assets/logo_transparent.png";
+import logo from "../../assets/logo.svg";
 import { providerSettingsRoute } from "@/routes/settings/providers/$provider";
 import { cn } from "@/lib/utils";
 import { useDeepLink } from "@/contexts/DeepLinkContext";
@@ -235,14 +235,6 @@ export function AICreditStatus({ userBudget }: { userBudget: UserBudgetInfo }) {
       </TooltipTrigger>
       <TooltipContent>
         <div>
-          <p>
-            You have used {Math.round(userBudget.usedCredits)} credits out of{" "}
-            {userBudget.totalCredits}.
-          </p>
-          <p>
-            Your budget resets on{" "}
-            {userBudget.budgetResetDate.toLocaleDateString()}
-          </p>
           <p>Note: there is a slight delay in updating the credit status.</p>
         </div>
       </TooltipContent>

@@ -11,6 +11,7 @@ const validInvokeChannels = [
   "get-language-model-providers",
   "delete-custom-language-model-provider",
   "create-custom-language-model-provider",
+  "edit-custom-language-model-provider",
   "delete-custom-language-model",
   "delete-custom-model",
   "chat:add-dep",
@@ -23,6 +24,7 @@ const validInvokeChannels = [
   "copy-app",
   "get-chat",
   "get-chats",
+  "search-chats",
   "get-chat-logs",
   "list-apps",
   "get-app",
@@ -33,6 +35,8 @@ const validInvokeChannels = [
   "run-app",
   "stop-app",
   "restart-app",
+  "respond-to-app-input",
+  "search-app",
   "list-versions",
   "revert-version",
   "checkout-version",
@@ -55,6 +59,9 @@ const validInvokeChannels = [
   "github:connect-existing-repo",
   "github:push",
   "github:disconnect",
+  "neon:create-project",
+  "neon:get-project",
+  "neon:delete-branch",
   "vercel:save-token",
   "vercel:list-projects",
   "vercel:is-project-available",
@@ -101,6 +108,25 @@ const validInvokeChannels = [
   "check-problems",
   "restart-dyad",
   "get-templates",
+  "portal:migrate-create",
+  // MCP
+  "mcp:list-servers",
+  "mcp:create-server",
+  "mcp:update-server",
+  "mcp:delete-server",
+  "mcp:list-tools",
+  "mcp:get-tool-consents",
+  "mcp:set-tool-consent",
+  // MCP consent response from renderer to main
+  "mcp:tool-consent-response",
+  // Help bot
+  "help:chat:start",
+  "help:chat:cancel",
+  // Prompts
+  "prompts:list",
+  "prompts:create",
+  "prompts:update",
+  "prompts:delete",
   // Test-only channels
   // These should ALWAYS be guarded with IS_TEST_BUILD in the main process.
   // We can't detect with IS_TEST_BUILD in the preload script because
@@ -118,6 +144,12 @@ const validReceiveChannels = [
   "github:flow-success",
   "github:flow-error",
   "deep-link-received",
+  // Help bot
+  "help:chat:response:chunk",
+  "help:chat:response:end",
+  "help:chat:response:error",
+  // MCP consent request from main to renderer
+  "mcp:tool-consent-request",
 ] as const;
 
 type ValidInvokeChannel = (typeof validInvokeChannels)[number];

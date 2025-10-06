@@ -6,6 +6,10 @@ import path from "path";
 import os from "os";
 import { execSync } from "child_process";
 import { generateAppFilesSnapshotData } from "./generateAppFilesSnapshotData";
+import {
+  BUILD_SYSTEM_POSTFIX,
+  BUILD_SYSTEM_PREFIX,
+} from "@/prompts/system_prompt";
 
 const showDebugLogs = process.env.DEBUG_LOGS === "true";
 
@@ -47,6 +51,18 @@ export class ContextFilesPickerDialog {
       .first()
       .click();
   }
+
+  async addExcludeContextFile(path: string) {
+    await this.page.getByTestId("exclude-context-files-input").fill(path);
+    await this.page.getByTestId("exclude-context-files-add-button").click();
+  }
+
+  async removeExcludeContextFile() {
+    await this.page
+      .getByTestId("exclude-context-files-remove-button")
+      .first()
+      .click();
+  }
 }
 
 class ProModesDialog {
@@ -55,8 +71,12 @@ class ProModesDialog {
     public close: () => Promise<void>,
   ) {}
 
-  async toggleSmartContext() {
-    await this.page.getByRole("switch", { name: "Smart Context" }).click();
+  async setSmartContextMode(mode: "balanced" | "off" | "conservative") {
+    await this.page
+      .getByRole("button", {
+        name: mode.charAt(0).toUpperCase() + mode.slice(1),
+      })
+      .click();
   }
 
   async toggleTurboEdits() {
@@ -239,58 +259,52 @@ export class PageObject {
     await this.goToAppsTab();
   }
 
-  async runPnpmInstall() {
+  async ensurePnpmInstall() {
     const appPath = await this.getCurrentAppPath();
     if (!appPath) {
       throw new Error("No app selected");
     }
 
-    const maxRetries = 3;
-    let lastError: any;
+    const maxDurationMs = 180_000; // 3 minutes
+    const retryIntervalMs = 15_000;
+    const startTime = Date.now();
+    let lastOutput = "";
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const checkCommand = `node -e 'const pkg=require("./package.json");const{execSync}=require("child_process");try{const prodResult=JSON.parse(execSync("pnpm list --json --depth=0",{encoding:"utf8"}));const devResult=JSON.parse(execSync("pnpm list --json --depth=0 --dev",{encoding:"utf8"}));const installed={...(prodResult[0]||{}).dependencies||{},...(devResult[0]||{}).devDependencies||{}};const expected=Object.keys({...pkg.dependencies||{},...pkg.devDependencies||{}});const missing=expected.filter(dep=>!installed[dep]);console.log(missing.length?"MISSING: "+missing.join(", "):"All dependencies installed")}catch(e){console.log("Error:",e.message)}'`;
+
+    while (Date.now() - startTime < maxDurationMs) {
       try {
-        console.log(
-          `Running 'pnpm install' in ${appPath} (attempt ${attempt}/${maxRetries})`,
-        );
-        execSync("pnpm install", {
+        console.log(`Checking installed dependencies in ${appPath}...`);
+        const stdout = execSync(checkCommand, {
           cwd: appPath,
           stdio: "pipe",
           encoding: "utf8",
         });
-        console.log(`'pnpm install' succeeded on attempt ${attempt}`);
-        return; // Success, exit the function
+        lastOutput = (stdout || "").toString().trim();
+        console.log(`Dependency check output: ${lastOutput}`);
+        if (lastOutput.includes("All dependencies installed")) {
+          return;
+        }
       } catch (error: any) {
-        lastError = error;
-        console.error(
-          `Attempt ${attempt}/${maxRetries} failed to run 'pnpm install' in ${appPath}`,
-        );
-        console.error(`Exit code: ${error.status}`);
-        console.error(`Command: ${error.cmd || "pnpm install"}`);
-
-        if (error.stdout) {
-          console.error(`STDOUT:\n${error.stdout}`);
-        }
-
-        if (error.stderr) {
-          console.error(`STDERR:\n${error.stderr}`);
-        }
-
-        // If this wasn't the last attempt, wait a bit before retrying
-        if (attempt < maxRetries) {
-          const delayMs = 1000 * attempt; // Exponential backoff: 1s, 2s
-          console.log(`Waiting ${delayMs}ms before retry...`);
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
-        }
+        // Capture any error output to include in the final error if we time out
+        const stdOut = error?.stdout ? error.stdout.toString() : "";
+        const stdErr = error?.stderr ? error.stderr.toString() : "";
+        lastOutput = [stdOut, stdErr, error?.message]
+          .filter(Boolean)
+          .join("\n");
+        console.error("Dependency check command failed:", lastOutput);
       }
+
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, maxDurationMs - elapsed);
+      const waitMs = Math.min(retryIntervalMs, remaining);
+      if (waitMs <= 0) break;
+      console.log(`Waiting ${waitMs}ms before retry...`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
 
-    // All attempts failed, throw the last error with enhanced message
     throw new Error(
-      `pnpm install failed in ${appPath} after ${maxRetries} attempts. ` +
-        `Exit code: ${lastError.status}. ` +
-        `${lastError.stderr ? `Error: ${lastError.stderr}` : ""}` +
-        `${lastError.stdout ? ` Output: ${lastError.stdout}` : ""}`,
+      `Dependencies not fully installed in ${appPath} after 3 minutes. Last output: ${lastOutput}`,
     );
   }
 
@@ -316,7 +330,7 @@ export class PageObject {
     await this.page.getByRole("button", { name: "Import" }).click();
   }
 
-  async selectChatMode(mode: "build" | "ask") {
+  async selectChatMode(mode: "build" | "ask" | "agent") {
     await this.page.getByTestId("chat-mode-selector").click();
     await this.page.getByRole("option", { name: mode }).click();
   }
@@ -417,6 +431,27 @@ export class PageObject {
   async clickRestart() {
     await this.page.getByRole("button", { name: "Restart" }).click();
   }
+  ////////////////////////////////
+  // Inline code editor
+  ////////////////////////////////
+  async clickEditButton() {
+    await this.page.locator('button:has-text("Edit")').first().click();
+  }
+
+  async editFileContent(content: string) {
+    const editor = this.page.locator(".monaco-editor textarea").first();
+    await editor.focus();
+    await editor.press("Home");
+    await editor.type(content);
+  }
+
+  async saveFile() {
+    await this.page.locator('[data-testid="save-file-button"]').click();
+  }
+
+  async cancelEdit() {
+    await this.page.locator('button:has-text("Cancel")').first().click();
+  }
 
   ////////////////////////////////
   // Preview panel
@@ -481,11 +516,11 @@ export class PageObject {
   }
 
   locateLoadingAppPreview() {
-    return this.page.getByText("Loading app preview...");
+    return this.page.getByText("Preparing app preview...");
   }
 
   locateStartingAppPreview() {
-    return this.page.getByText("Starting up your app...");
+    return this.page.getByText("Starting your app server...");
   }
 
   getPreviewIframeElement() {
@@ -633,7 +668,9 @@ export class PageObject {
   }
 
   getChatInput() {
-    return this.page.getByRole("textbox", { name: "Ask Dyad to build..." });
+    return this.page.locator(
+      '[data-lexical-editor="true"][aria-placeholder="Ask Dyad to build..."]',
+    );
   }
 
   clickNewChat({ index = 0 }: { index?: number } = {}) {
@@ -648,16 +685,21 @@ export class PageObject {
     await this.page.getByRole("button", { name: "Back" }).click();
   }
 
-  async sendPrompt(prompt: string) {
+  async sendPrompt(
+    prompt: string,
+    { skipWaitForCompletion = false }: { skipWaitForCompletion?: boolean } = {},
+  ) {
     await this.getChatInput().click();
     await this.getChatInput().fill(prompt);
     await this.page.getByRole("button", { name: "Send message" }).click();
-    await this.waitForChatCompletion();
+    if (!skipWaitForCompletion) {
+      await this.waitForChatCompletion();
+    }
   }
 
   async selectModel({ provider, model }: { provider: string; model: string }) {
     await this.page.getByRole("button", { name: "Model: Auto" }).click();
-    await this.page.getByText(provider).click();
+    await this.page.getByText(provider, { exact: true }).click();
     await this.page.getByText(model, { exact: true }).click();
   }
 
@@ -683,6 +725,24 @@ export class PageObject {
       .getByText("lmstudio-model-1", { exact: true })
       .first()
       .click();
+  }
+
+  async selectTestAzureModel() {
+    await this.page.getByRole("button", { name: "Model: Auto" }).click();
+    await this.page.getByText("Other AI providers").click();
+    await this.page.getByText("Azure OpenAI", { exact: true }).click();
+    await this.page.getByText("GPT-5", { exact: true }).click();
+  }
+
+  async setUpAzure({ autoApprove = false }: { autoApprove?: boolean } = {}) {
+    await this.githubConnector.clearPushEvents();
+    await this.goToSettingsTab();
+    if (autoApprove) {
+      await this.toggleAutoApprove();
+    }
+    // Azure should already be configured via environment variables
+    // so we don't need additional setup steps like setUpDyadProvider
+    await this.goToAppsTab();
   }
 
   async setUpTestProvider() {
@@ -717,6 +777,30 @@ export class PageObject {
 
   async goToSettingsTab() {
     await this.page.getByRole("link", { name: "Settings" }).click();
+  }
+
+  async goToLibraryTab() {
+    await this.page.getByRole("link", { name: "Library" }).click();
+  }
+
+  async createPrompt({
+    title,
+    description,
+    content,
+  }: {
+    title: string;
+    description?: string;
+    content: string;
+  }) {
+    await this.page.getByRole("button", { name: "New Prompt" }).click();
+    await this.page.getByRole("textbox", { name: "Title" }).fill(title);
+    if (description) {
+      await this.page
+        .getByRole("textbox", { name: "Description (optional)" })
+        .fill(description);
+    }
+    await this.page.getByRole("textbox", { name: "Content" }).fill(content);
+    await this.page.getByRole("button", { name: "Save" }).click();
   }
 
   getTitleBarAppNameButton() {
@@ -866,6 +950,7 @@ export class PageObject {
 
   async goToAppsTab() {
     await this.page.getByRole("link", { name: "Apps" }).click();
+    await expect(this.page.getByText("Build your dream app")).toBeVisible();
   }
 
   async goToChatTab() {
@@ -943,6 +1028,7 @@ export class PageObject {
 
 interface ElectronConfig {
   preLaunchHook?: ({ userDataDir }: { userDataDir: string }) => Promise<void>;
+  showSetupScreen?: boolean;
 }
 
 // From https://github.com/microsoft/playwright/issues/8208#issuecomment-1435475930
@@ -1005,8 +1091,10 @@ export const test = base.extend<{
       process.env.DYAD_ENGINE_URL = "http://localhost:3500/engine/v1";
       process.env.DYAD_GATEWAY_URL = "http://localhost:3500/gateway/v1";
       process.env.E2E_TEST_BUILD = "true";
-      // This is just a hack to avoid the AI setup screen.
-      process.env.OPENAI_API_KEY = "sk-test";
+      if (!electronConfig.showSetupScreen) {
+        // This is just a hack to avoid the AI setup screen.
+        process.env.OPENAI_API_KEY = "sk-test";
+      }
       const baseTmpDir = os.tmpdir();
       const userDataDir = path.join(baseTmpDir, `dyad-e2e-tests-${Date.now()}`);
       if (electronConfig.preLaunchHook) {
@@ -1090,6 +1178,17 @@ export function testWithConfig(config: ElectronConfig) {
   });
 }
 
+export function testWithConfigSkipIfWindows(config: ElectronConfig) {
+  if (os.platform() === "win32") {
+    return test.skip;
+  }
+  return test.extend({
+    electronConfig: async ({}, use) => {
+      await use(config);
+    },
+  });
+}
+
 // Wrapper that skips tests on Windows platform
 export const testSkipIfWindows = os.platform() === "win32" ? test.skip : test;
 
@@ -1107,6 +1206,8 @@ function prettifyDump(
       const content = Array.isArray(message.content)
         ? JSON.stringify(message.content)
         : message.content
+            .replace(BUILD_SYSTEM_PREFIX, "\n${BUILD_SYSTEM_PREFIX}")
+            .replace(BUILD_SYSTEM_POSTFIX, "${BUILD_SYSTEM_POSTFIX}")
             // Normalize line endings to always use \n
             .replace(/\r\n/g, "\n")
             // We remove package.json because it's flaky.

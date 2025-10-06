@@ -1,7 +1,3 @@
-import {
-  LanguageModelV1,
-  LanguageModelV1ObjectGenerationMode,
-} from "@ai-sdk/provider";
 import { OpenAICompatibleChatLanguageModel } from "@ai-sdk/openai-compatible";
 import {
   FetchFunction,
@@ -9,16 +5,16 @@ import {
   withoutTrailingSlash,
 } from "@ai-sdk/provider-utils";
 
-import { OpenAICompatibleChatSettings } from "@ai-sdk/openai-compatible";
 import log from "electron-log";
 import { getExtraProviderOptions } from "./thinking_utils";
 import type { UserSettings } from "../../lib/schemas";
+import { LanguageModelV2 } from "@ai-sdk/provider";
 
 const logger = log.scope("llm_engine_provider");
 
 export type ExampleChatModelId = string & {};
 
-export interface ExampleChatSettings extends OpenAICompatibleChatSettings {
+export interface ExampleChatSettings {
   files?: { path: string; content: string }[];
 }
 export interface ExampleProviderSettings {
@@ -48,6 +44,8 @@ or to provide a custom fetch implementation for e.g. testing.
   dyadOptions: {
     enableLazyEdits?: boolean;
     enableSmartFilesContext?: boolean;
+    enableWebSearch?: boolean;
+    smartContextMode?: "balanced" | "conservative";
   };
   settings: UserSettings;
 }
@@ -59,7 +57,7 @@ Creates a model for text generation.
   (
     modelId: ExampleChatModelId,
     settings?: ExampleChatSettings,
-  ): LanguageModelV1;
+  ): LanguageModelV2;
 
   /**
 Creates a chat model for text generation.
@@ -67,7 +65,7 @@ Creates a chat model for text generation.
   chatModel(
     modelId: ExampleChatModelId,
     settings?: ExampleChatSettings,
-  ): LanguageModelV1;
+  ): LanguageModelV2;
 }
 
 export function createDyadEngine(
@@ -113,13 +111,13 @@ export function createDyadEngine(
     settings: ExampleChatSettings = {},
   ) => {
     // Extract files from settings to process them appropriately
-    const { files, ...restSettings } = settings;
+    const { files } = settings;
 
     // Create configuration with file handling
     const config = {
       ...getCommonModelConfig(),
-      defaultObjectGenerationMode:
-        "tool" as LanguageModelV1ObjectGenerationMode,
+      // defaultObjectGenerationMode:
+      //   "tool" as LanguageModelV1ObjectGenerationMode,
       // Custom fetch implementation that adds files to the request
       fetch: (input: RequestInfo | URL, init?: RequestInit) => {
         // Use default fetch if no init or body
@@ -140,6 +138,14 @@ export function createDyadEngine(
           if ("dyadRequestId" in parsedBody) {
             delete parsedBody.dyadRequestId;
           }
+          const dyadDisableFiles = parsedBody.dyadDisableFiles;
+          if ("dyadDisableFiles" in parsedBody) {
+            delete parsedBody.dyadDisableFiles;
+          }
+          const dyadMentionedApps = parsedBody.dyadMentionedApps;
+          if ("dyadMentionedApps" in parsedBody) {
+            delete parsedBody.dyadMentionedApps;
+          }
 
           // Track and modify requestId with attempt number
           let modifiedRequestId = requestId;
@@ -150,13 +156,18 @@ export function createDyadEngine(
           }
 
           // Add files to the request if they exist
-          if (files?.length) {
+          if (files?.length && !dyadDisableFiles) {
             parsedBody.dyad_options = {
               files,
               enable_lazy_edits: options.dyadOptions.enableLazyEdits,
               enable_smart_files_context:
                 options.dyadOptions.enableSmartFilesContext,
+              smart_context_mode: options.dyadOptions.smartContextMode,
+              enable_web_search: options.dyadOptions.enableWebSearch,
             };
+            if (dyadMentionedApps?.length) {
+              parsedBody.dyad_options.mentioned_apps = dyadMentionedApps;
+            }
           }
 
           // Return modified request with files included and requestId in headers
@@ -181,7 +192,7 @@ export function createDyadEngine(
       },
     };
 
-    return new OpenAICompatibleChatLanguageModel(modelId, restSettings, config);
+    return new OpenAICompatibleChatLanguageModel(modelId, config);
   };
 
   const provider = (

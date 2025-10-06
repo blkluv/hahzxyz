@@ -18,7 +18,7 @@ import {
   SendHorizontalIcon,
 } from "lucide-react";
 import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { useSettings } from "@/hooks/useSettings";
 import { IpcClient } from "@/ipc/ipc_client";
@@ -64,13 +64,14 @@ import { ChatErrorBox } from "./ChatErrorBox";
 import { selectedComponentPreviewAtom } from "@/atoms/previewAtoms";
 import { SelectedComponentDisplay } from "./SelectedComponentDisplay";
 import { useCheckProblems } from "@/hooks/useCheckProblems";
+import { LexicalChatInput } from "./LexicalChatInput";
+import { useChatModeToggle } from "@/hooks/useChatModeToggle";
 
 const showTokenBarAtom = atom(false);
 
 export function ChatInput({ chatId }: { chatId?: number }) {
   const posthog = usePostHog();
   const [inputValue, setInputValue] = useAtom(chatInputValueAtom);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { settings } = useSettings();
   const appId = useAtomValue(selectedAppIdAtom);
   const { refreshVersions } = useVersions(appId);
@@ -79,7 +80,7 @@ export function ChatInput({ chatId }: { chatId?: number }) {
   const [showError, setShowError] = useState(true);
   const [isApproving, setIsApproving] = useState(false); // State for approving
   const [isRejecting, setIsRejecting] = useState(false); // State for rejecting
-  const [, setMessages] = useAtom<Message[]>(chatMessagesAtom);
+  const [messages, setMessages] = useAtom<Message[]>(chatMessagesAtom);
   const setIsPreviewOpen = useSetAtom(isPreviewOpenAtom);
   const [showTokenBar, setShowTokenBar] = useAtom(showTokenBarAtom);
   const [selectedComponent, setSelectedComponent] = useAtom(
@@ -107,19 +108,15 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     refreshProposal,
   } = useProposal(chatId);
   const { proposal, messageId } = proposalResult ?? {};
+  useChatModeToggle();
 
-  const adjustHeight = () => {
-    const textarea = textareaRef.current;
-    if (textarea) {
-      textarea.style.height = "0px";
-      const scrollHeight = textarea.scrollHeight;
-      textarea.style.height = `${scrollHeight + 4}px`;
-    }
-  };
-
-  useEffect(() => {
-    adjustHeight();
-  }, [inputValue]);
+  const lastMessage = messages.at(-1);
+  const disableSendButton =
+    lastMessage?.role === "assistant" &&
+    !lastMessage.approvalState &&
+    !!proposal &&
+    proposal.type === "code-proposal" &&
+    messageId === lastMessage.id;
 
   useEffect(() => {
     if (error) {
@@ -135,13 +132,6 @@ export function ChatInput({ chatId }: { chatId?: number }) {
     const chat = await IpcClient.getInstance().getChat(chatId);
     setMessages(chat.messages);
   }, [chatId, setMessages]);
-
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit();
-    }
-  };
 
   const handleSubmit = async () => {
     if (
@@ -234,7 +224,6 @@ export function ChatInput({ chatId }: { chatId?: number }) {
       setError((err as Error)?.message || "An error occurred while rejecting");
     } finally {
       setIsRejecting(false);
-
       // Keep same as handleApprove
       refreshProposal();
       fetchChatMessages();
@@ -307,15 +296,13 @@ export function ChatInput({ chatId }: { chatId?: number }) {
           <DragDropOverlay isDraggingOver={isDraggingOver} />
 
           <div className="flex items-start space-x-2 ">
-            <textarea
-              ref={textareaRef}
+            <LexicalChatInput
               value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              onKeyPress={handleKeyPress}
+              onChange={setInputValue}
+              onSubmit={handleSubmit}
               onPaste={handlePaste}
               placeholder="Ask Dyad to build..."
-              className="flex-1 p-2 focus:outline-none overflow-y-auto min-h-[40px] max-h-[200px]"
-              style={{ resize: "none" }}
+              excludeCurrentApp={true}
             />
 
             {isStreaming ? (
@@ -329,7 +316,10 @@ export function ChatInput({ chatId }: { chatId?: number }) {
             ) : (
               <button
                 onClick={handleSubmit}
-                disabled={!inputValue.trim() && attachments.length === 0}
+                disabled={
+                  (!inputValue.trim() && attachments.length === 0) ||
+                  disableSendButton
+                }
                 className="px-2 py-2 mt-1 mr-1 hover:bg-(--background-darkest) text-(--sidebar-accent-fg) rounded-lg disabled:opacity-50"
                 title="Send message"
               >

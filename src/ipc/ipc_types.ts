@@ -3,10 +3,15 @@ import type { ProblemReport, Problem } from "../../shared/tsc_types";
 export type { ProblemReport, Problem };
 
 export interface AppOutput {
-  type: "stdout" | "stderr" | "info" | "client-error";
+  type: "stdout" | "stderr" | "info" | "client-error" | "input-requested";
   message: string;
   timestamp: number;
   appId: number;
+}
+
+export interface RespondToAppInputParams {
+  appId: number;
+  response: string;
 }
 
 export interface ListAppsResponse {
@@ -61,6 +66,8 @@ export interface Message {
   content: string;
   approvalState?: "approved" | "rejected" | null;
   commitHash?: string | null;
+  dbTimestamp?: string | null;
+  createdAt?: Date | string;
 }
 
 export interface Chat {
@@ -68,6 +75,7 @@ export interface Chat {
   title: string;
   messages: Message[];
   initialCommitHash?: string | null;
+  dbTimestamp?: string | null;
 }
 
 export interface App {
@@ -82,16 +90,22 @@ export interface App {
   githubBranch: string | null;
   supabaseProjectId: string | null;
   supabaseProjectName: string | null;
+  neonProjectId: string | null;
+  neonDevelopmentBranchId: string | null;
+  neonPreviewBranchId: string | null;
   vercelProjectId: string | null;
   vercelProjectName: string | null;
   vercelTeamSlug: string | null;
   vercelDeploymentUrl: string | null;
+  installCommand: string | null;
+  startCommand: string | null;
 }
 
 export interface Version {
   oid: string;
   message: string;
   timestamp: number;
+  dbTimestamp?: string | null;
 }
 
 export type BranchResult = { branch: string };
@@ -141,6 +155,7 @@ export interface TokenCountResult {
   totalTokens: number;
   messageHistoryTokens: number;
   codebaseTokens: number;
+  mentionedAppsTokens: number;
   inputTokens: number;
   systemPromptTokens: number;
   contextWindow: number;
@@ -158,6 +173,7 @@ export interface LanguageModelProvider {
   hasFreeTier?: boolean;
   websiteUrl?: string;
   gatewayPrefix?: string;
+  secondary?: boolean;
   envVarName?: string;
   apiBaseUrl?: string;
   type: "custom" | "local" | "cloud";
@@ -170,8 +186,11 @@ export type LanguageModel =
       displayName: string;
       description: string;
       tag?: string;
+      tagColor?: string;
       maxOutputTokens?: number;
       contextWindow?: number;
+      temperature?: number;
+      dollarSigns?: number;
       type: "custom";
     }
   | {
@@ -179,8 +198,11 @@ export type LanguageModel =
       displayName: string;
       description: string;
       tag?: string;
+      tagColor?: string;
       maxOutputTokens?: number;
       contextWindow?: number;
+      temperature?: number;
+      dollarSigns?: number;
       type: "local" | "cloud";
     };
 
@@ -212,6 +234,8 @@ export interface ApproveProposalResult {
 export interface ImportAppParams {
   path: string;
   appName: string;
+  installCommand?: string;
+  startCommand?: string;
 }
 
 export interface CopyAppParams {
@@ -335,7 +359,130 @@ export interface UploadFileToCodebaseResult {
   filePath: string;
 }
 
+// --- Prompts ---
+export interface PromptDto {
+  id: number;
+  title: string;
+  description: string | null;
+  content: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface CreatePromptParamsDto {
+  title: string;
+  description?: string;
+  content: string;
+}
+
+export interface UpdatePromptParamsDto extends CreatePromptParamsDto {
+  id: number;
+}
+
 export interface FileAttachment {
   file: File;
   type: "upload-to-codebase" | "chat-context";
+}
+
+// --- Neon Types ---
+export interface CreateNeonProjectParams {
+  name: string;
+  appId: number;
+}
+
+export interface NeonProject {
+  id: string;
+  name: string;
+  connectionString: string;
+  branchId: string;
+}
+
+export interface NeonBranch {
+  type: "production" | "development" | "snapshot" | "preview";
+  branchId: string;
+  branchName: string;
+  lastUpdated: string; // ISO timestamp
+  parentBranchId?: string; // ID of the parent branch
+  parentBranchName?: string; // Name of the parent branch
+}
+
+export interface GetNeonProjectParams {
+  appId: number;
+}
+
+export interface GetNeonProjectResponse {
+  projectId: string;
+  projectName: string;
+  orgId: string;
+  branches: NeonBranch[];
+}
+
+export interface RevertVersionParams {
+  appId: number;
+  previousVersionId: string;
+}
+
+export type RevertVersionResponse =
+  | { successMessage: string }
+  | { warningMessage: string };
+
+// --- Help Bot Types ---
+export interface StartHelpChatParams {
+  sessionId: string;
+  message: string;
+}
+
+export interface HelpChatResponseChunk {
+  sessionId: string;
+  delta: string;
+  type: "text";
+}
+
+export interface HelpChatResponseReasoning {
+  sessionId: string;
+  delta: string;
+  type: "reasoning";
+}
+
+export interface HelpChatResponseEnd {
+  sessionId: string;
+}
+
+export interface HelpChatResponseError {
+  sessionId: string;
+  error: string;
+}
+
+// --- MCP Types ---
+export interface McpServer {
+  id: number;
+  name: string;
+  transport: string;
+  command?: string | null;
+  args?: string[] | null;
+  cwd?: string | null;
+  envJson?: Record<string, string> | null;
+  url?: string | null;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CreateMcpServer
+  extends Omit<McpServer, "id" | "createdAt" | "updatedAt"> {}
+export type McpServerUpdate = Partial<McpServer> & Pick<McpServer, "id">;
+export type McpToolConsentType = "ask" | "always" | "denied";
+
+export interface McpTool {
+  name: string;
+  description?: string | null;
+  consent: McpToolConsentType;
+}
+
+export interface McpToolConsent {
+  id: number;
+  serverId: number;
+  toolName: string;
+  consent: McpToolConsentType;
+  updatedAt: number;
 }

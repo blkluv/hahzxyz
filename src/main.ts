@@ -17,6 +17,7 @@ import { IS_TEST_BUILD } from "./ipc/utils/test_utils";
 import { BackupManager } from "./backup_manager";
 import { getDatabasePath, initializeDatabase } from "./db";
 import { UserSettings } from "./lib/schemas";
+import { handleNeonOAuthReturn } from "./neon_admin/neon_return_handler";
 
 log.errorHandler.startCatching();
 log.eventLogger.startLogging();
@@ -132,7 +133,9 @@ const createWindow = () => {
   // Create the browser window.
   mainWindow = new BrowserWindow({
     width: process.env.NODE_ENV === "development" ? 1280 : 960,
+    minWidth: 800,
     height: 700,
+    minHeight: 500,
     titleBarStyle: "hidden",
     titleBarOverlay: false,
     trafficLightPosition: {
@@ -208,6 +211,24 @@ function handleDeepLinkReturn(url: string) {
     );
     return;
   }
+  if (parsed.hostname === "neon-oauth-return") {
+    const token = parsed.searchParams.get("token");
+    const refreshToken = parsed.searchParams.get("refreshToken");
+    const expiresIn = Number(parsed.searchParams.get("expiresIn"));
+    if (!token || !refreshToken || !expiresIn) {
+      dialog.showErrorBox(
+        "Invalid URL",
+        "Expected token, refreshToken, and expiresIn",
+      );
+      return;
+    }
+    handleNeonOAuthReturn({ token, refreshToken, expiresIn });
+    // Send message to renderer to trigger re-render
+    mainWindow?.webContents.send("deep-link-received", {
+      type: parsed.hostname,
+    });
+    return;
+  }
   if (parsed.hostname === "supabase-oauth-return") {
     const token = parsed.searchParams.get("token");
     const refreshToken = parsed.searchParams.get("refreshToken");
@@ -223,7 +244,6 @@ function handleDeepLinkReturn(url: string) {
     // Send message to renderer to trigger re-render
     mainWindow?.webContents.send("deep-link-received", {
       type: parsed.hostname,
-      url,
     });
     return;
   }
@@ -240,7 +260,6 @@ function handleDeepLinkReturn(url: string) {
     // Send message to renderer to trigger re-render
     mainWindow?.webContents.send("deep-link-received", {
       type: parsed.hostname,
-      url,
     });
     return;
   }

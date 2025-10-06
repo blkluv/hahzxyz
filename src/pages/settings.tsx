@@ -16,11 +16,15 @@ import { useRouter } from "@tanstack/react-router";
 import { GitHubIntegration } from "@/components/GitHubIntegration";
 import { VercelIntegration } from "@/components/VercelIntegration";
 import { SupabaseIntegration } from "@/components/SupabaseIntegration";
+
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { AutoFixProblemsSwitch } from "@/components/AutoFixProblemsSwitch";
 import { AutoUpdateSwitch } from "@/components/AutoUpdateSwitch";
 import { ReleaseChannelSelector } from "@/components/ReleaseChannelSelector";
+import { NeonIntegration } from "@/components/NeonIntegration";
+import { RuntimeModeSelector } from "@/components/RuntimeModeSelector";
+import { ToolsMcpSettings } from "@/components/settings/ToolsMcpSettings";
 
 export default function SettingsPage() {
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
@@ -112,7 +116,19 @@ export default function SettingsPage() {
               <GitHubIntegration />
               <VercelIntegration />
               <SupabaseIntegration />
+              <NeonIntegration />
             </div>
+          </div>
+
+          {/* Tools (MCP) */}
+          <div
+            id="tools-mcp"
+            className="bg-white dark:bg-gray-800 rounded-xl shadow-sm p-6"
+          >
+            <h2 className="text-lg font-medium text-gray-900 dark:text-white mb-4">
+              Tools (MCP)
+            </h2>
+            <ToolsMcpSettings />
           </div>
 
           {/* Experiments Section */}
@@ -251,6 +267,10 @@ export function GeneralSettings({ appVersion }: { appVersion: string | null }) {
 
       <div className="mt-4">
         <ReleaseChannelSelector />
+      </div>
+
+      <div className="mt-4">
+        <RuntimeModeSelector />
       </div>
 
       <div className="flex items-center text-sm text-gray-500 dark:text-gray-400 mt-4">

@@ -1,11 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getUserDataPath } from "../paths/paths";
-import { UserSettingsSchema, type UserSettings, Secret } from "../lib/schemas";
+import {
+  UserSettingsSchema,
+  type UserSettings,
+  Secret,
+  VertexProviderSetting,
+} from "../lib/schemas";
 import { safeStorage } from "electron";
 import { v4 as uuidv4 } from "uuid";
 import log from "electron-log";
 import { DEFAULT_TEMPLATE_ID } from "@/shared/templates";
+import { IS_TEST_BUILD } from "@/ipc/utils/test_utils";
 
 const logger = log.scope("settings");
 
@@ -69,6 +75,27 @@ export function readSettings(): UserSettings {
         }
       }
     }
+    const neon = combinedSettings.neon;
+    if (neon) {
+      if (neon.refreshToken) {
+        const encryptionType = neon.refreshToken.encryptionType;
+        if (encryptionType) {
+          neon.refreshToken = {
+            value: decrypt(neon.refreshToken),
+            encryptionType,
+          };
+        }
+      }
+      if (neon.accessToken) {
+        const encryptionType = neon.accessToken.encryptionType;
+        if (encryptionType) {
+          neon.accessToken = {
+            value: decrypt(neon.accessToken),
+            encryptionType,
+          };
+        }
+      }
+    }
     if (combinedSettings.githubAccessToken) {
       const encryptionType = combinedSettings.githubAccessToken.encryptionType;
       combinedSettings.githubAccessToken = {
@@ -89,6 +116,17 @@ export function readSettings(): UserSettings {
           combinedSettings.providerSettings[provider].apiKey.encryptionType;
         combinedSettings.providerSettings[provider].apiKey = {
           value: decrypt(combinedSettings.providerSettings[provider].apiKey),
+          encryptionType,
+        };
+      }
+      // Decrypt Vertex service account key if present
+      const v = combinedSettings.providerSettings[
+        provider
+      ] as VertexProviderSetting;
+      if (provider === "vertex" && v?.serviceAccountKey) {
+        const encryptionType = v.serviceAccountKey.encryptionType;
+        v.serviceAccountKey = {
+          value: decrypt(v.serviceAccountKey),
           encryptionType,
         };
       }
@@ -131,11 +169,28 @@ export function writeSettings(settings: Partial<UserSettings>): void {
         );
       }
     }
+    if (newSettings.neon) {
+      if (newSettings.neon.accessToken) {
+        newSettings.neon.accessToken = encrypt(
+          newSettings.neon.accessToken.value,
+        );
+      }
+      if (newSettings.neon.refreshToken) {
+        newSettings.neon.refreshToken = encrypt(
+          newSettings.neon.refreshToken.value,
+        );
+      }
+    }
     for (const provider in newSettings.providerSettings) {
       if (newSettings.providerSettings[provider].apiKey) {
         newSettings.providerSettings[provider].apiKey = encrypt(
           newSettings.providerSettings[provider].apiKey.value,
         );
+      }
+      // Encrypt Vertex service account key if present
+      const v = newSettings.providerSettings[provider] as VertexProviderSetting;
+      if (provider === "vertex" && v?.serviceAccountKey) {
+        v.serviceAccountKey = encrypt(v.serviceAccountKey.value);
       }
     }
     const validatedSettings = UserSettingsSchema.parse(newSettings);
@@ -146,7 +201,7 @@ export function writeSettings(settings: Partial<UserSettings>): void {
 }
 
 export function encrypt(data: string): Secret {
-  if (safeStorage.isEncryptionAvailable()) {
+  if (safeStorage.isEncryptionAvailable() && !IS_TEST_BUILD) {
     return {
       value: safeStorage.encryptString(data).toString("base64"),
       encryptionType: "electron-safe-storage",

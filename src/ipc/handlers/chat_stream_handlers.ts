@@ -1,13 +1,16 @@
 import { v4 as uuidv4 } from "uuid";
-import { ipcMain } from "electron";
+import { ipcMain, IpcMainInvokeEvent } from "electron";
 import {
-  CoreMessage,
+  ModelMessage,
   TextPart,
   ImagePart,
   streamText,
   ToolSet,
   TextStreamPart,
+  stepCountIs,
+  hasToolCall,
 } from "ai";
+
 import { db } from "../../db";
 import { chats, messages } from "../../db/schema";
 import { and, eq, isNull } from "drizzle-orm";
@@ -38,10 +41,12 @@ import * as path from "path";
 import * as os from "os";
 import * as crypto from "crypto";
 import { readFile, writeFile, unlink } from "fs/promises";
-import { getMaxTokens } from "../utils/token_utils";
+import { getMaxTokens, getTemperature } from "../utils/token_utils";
 import { MAX_CHAT_TURNS_IN_CONTEXT } from "@/constants/settings_constants";
 import { validateChatContext } from "../utils/context_paths_utils";
 import { GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
+import { mcpServers } from "../../db/schema";
+import { requireMcpToolConsent } from "../utils/mcp_consent";
 
 import { getExtraProviderOptions } from "../utils/thinking_utils";
 
@@ -58,6 +63,14 @@ import {
 } from "../utils/dyad_tag_parser";
 import { fileExists } from "../utils/file_utils";
 import { FileUploadsState } from "../utils/file_uploads_state";
+import { OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
+import { extractMentionedAppsCodebases } from "../utils/mention_apps";
+import { parseAppMentions } from "@/shared/parse_mention_apps";
+import { prompts as promptsTable } from "../../db/schema";
+import { inArray } from "drizzle-orm";
+import { replacePromptReference } from "../utils/replacePromptReference";
+import { mcpManager } from "../utils/mcp_manager";
+import z from "zod";
 
 type AsyncIterableStream<T> = AsyncIterable<T> & ReadableStream<T>;
 
@@ -97,6 +110,23 @@ function escapeXml(unsafe: string): string {
     .replace(/"/g, "&quot;");
 }
 
+// Safely parse an MCP tool key that combines server and tool names.
+// We split on the LAST occurrence of "__" to avoid ambiguity if either
+// side contains "__" as part of its sanitized name.
+function parseMcpToolKey(toolKey: string): {
+  serverName: string;
+  toolName: string;
+} {
+  const separator = "__";
+  const lastIndex = toolKey.lastIndexOf(separator);
+  if (lastIndex === -1) {
+    return { serverName: "", toolName: toolKey };
+  }
+  const serverName = toolKey.slice(0, lastIndex);
+  const toolName = toolKey.slice(lastIndex + separator.length);
+  return { serverName, toolName };
+}
+
 // Ensure the temp directory exists
 if (!fs.existsSync(TEMP_DIR)) {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
@@ -123,19 +153,32 @@ async function processStreamChunks({
 
   for await (const part of fullStream) {
     let chunk = "";
+    if (
+      inThinkingBlock &&
+      !["reasoning-delta", "reasoning-end", "reasoning-start"].includes(
+        part.type,
+      )
+    ) {
+      chunk = "</think>";
+      inThinkingBlock = false;
+    }
     if (part.type === "text-delta") {
-      if (inThinkingBlock) {
-        chunk = "</think>";
-        inThinkingBlock = false;
-      }
-      chunk += part.textDelta;
-    } else if (part.type === "reasoning") {
+      chunk += part.text;
+    } else if (part.type === "reasoning-delta") {
       if (!inThinkingBlock) {
         chunk = "<think>";
         inThinkingBlock = true;
       }
 
-      chunk += escapeDyadTags(part.textDelta);
+      chunk += escapeDyadTags(part.text);
+    } else if (part.type === "tool-call") {
+      const { serverName, toolName } = parseMcpToolKey(part.toolName);
+      const content = escapeDyadTags(JSON.stringify(part.input));
+      chunk = `<dyad-mcp-tool-call server="${serverName}" tool="${toolName}">\n${content}\n</dyad-mcp-tool-call>\n`;
+    } else if (part.type === "tool-result") {
+      const { serverName, toolName } = parseMcpToolKey(part.toolName);
+      const content = escapeDyadTags(part.output);
+      chunk = `<dyad-mcp-tool-result server="${serverName}" tool="${toolName}">\n${content}\n</dyad-mcp-tool-result>\n`;
     }
 
     if (!chunk) {
@@ -271,6 +314,26 @@ export function registerChatStreamHandlers() {
 
       // Add user message to database with attachment info
       let userPrompt = req.prompt + (attachmentInfo ? attachmentInfo : "");
+      // Inline referenced prompt contents for mentions like @prompt:<id>
+      try {
+        const matches = Array.from(userPrompt.matchAll(/@prompt:(\d+)/g));
+        if (matches.length > 0) {
+          const ids = Array.from(new Set(matches.map((m) => Number(m[1]))));
+          const referenced = await db
+            .select()
+            .from(promptsTable)
+            .where(inArray(promptsTable.id, ids));
+          if (referenced.length > 0) {
+            const promptsMap: Record<number, string> = {};
+            for (const p of referenced) {
+              promptsMap[p.id] = p.content;
+            }
+            userPrompt = replacePromptReference(userPrompt, promptsMap);
+          }
+        }
+      } catch (e) {
+        logger.error("Failed to inline referenced prompts:", e);
+      }
       if (req.selectedComponent) {
         let componentSnippet = "[component snippet not available]";
         try {
@@ -379,10 +442,37 @@ ${componentSnippet}
             }
           : validateChatContext(updatedChat.app.chatContext);
 
+        // Parse app mentions from the prompt
+        const mentionedAppNames = parseAppMentions(req.prompt);
+
+        // Extract codebase for current app
         const { formattedOutput: codebaseInfo, files } = await extractCodebase({
           appPath,
           chatContext,
         });
+
+        // Extract codebases for mentioned apps
+        const mentionedAppsCodebases = await extractMentionedAppsCodebases(
+          mentionedAppNames,
+          updatedChat.app.id, // Exclude current app
+        );
+
+        // Combine current app codebase with mentioned apps' codebases
+        let otherAppsCodebaseInfo = "";
+        if (mentionedAppsCodebases.length > 0) {
+          const mentionedAppsSection = mentionedAppsCodebases
+            .map(
+              ({ appName, codebaseInfo }) =>
+                `\n\n=== Referenced App: ${appName} ===\n${codebaseInfo}`,
+            )
+            .join("");
+
+          otherAppsCodebaseInfo = mentionedAppsSection;
+
+          logger.log(
+            `Added ${mentionedAppsCodebases.length} mentioned app codebases`,
+          );
+        }
 
         logger.log(`Extracted codebase information from ${appPath}`);
         logger.log(
@@ -443,8 +533,20 @@ ${componentSnippet}
 
         let systemPrompt = constructSystemPrompt({
           aiRules: await readAiRules(getDyadAppPath(updatedChat.app.path)),
-          chatMode: settings.selectedChatMode,
+          chatMode:
+            settings.selectedChatMode === "agent"
+              ? "build"
+              : settings.selectedChatMode,
         });
+
+        // Add information about mentioned apps if any
+        if (otherAppsCodebaseInfo) {
+          const mentionedAppsList = mentionedAppsCodebases
+            .map(({ appName }) => appName)
+            .join(", ");
+
+          systemPrompt += `\n\n# Referenced Apps\nThe user has mentioned the following apps in their prompt: ${mentionedAppsList}. Their codebases have been included in the context for your reference. When referring to these apps, you can understand their structure and code to provide better assistance, however you should NOT edit the files in these referenced apps. The referenced apps are NOT part of the current app and are READ-ONLY.`;
+        }
         if (
           updatedChat.app?.supabaseProjectId &&
           settings.supabase?.accessToken?.value
@@ -456,7 +558,10 @@ ${componentSnippet}
             (await getSupabaseContext({
               supabaseProjectId: updatedChat.app.supabaseProjectId,
             }));
-        } else {
+        } else if (
+          // Neon projects don't need Supabase.
+          !updatedChat.app?.neonProjectId
+        ) {
           systemPrompt += "\n\n" + SUPABASE_NOT_AVAILABLE_SYSTEM_PROMPT;
         }
         const isSummarizeIntent = req.prompt.startsWith(
@@ -525,18 +630,37 @@ This conversation includes one or more image attachments. When the user uploads 
               },
             ] as const);
 
-        let chatMessages: CoreMessage[] = [
+        // If engine is enabled, we will send the other apps codebase info to the engine
+        // and process it with smart context.
+        const otherCodebasePrefix =
+          otherAppsCodebaseInfo && !isEngineEnabled
+            ? ([
+                {
+                  role: "user",
+                  content: createOtherAppsCodebasePrompt(otherAppsCodebaseInfo),
+                },
+                {
+                  role: "assistant",
+                  content: "OK.",
+                },
+              ] as const)
+            : [];
+
+        const limitedHistoryChatMessages = limitedMessageHistory.map((msg) => ({
+          role: msg.role as "user" | "assistant" | "system",
+          // Why remove thinking tags?
+          // Thinking tags are generally not critical for the context
+          // and eats up extra tokens.
+          content:
+            settings.selectedChatMode === "ask"
+              ? removeDyadTags(removeNonEssentialTags(msg.content))
+              : removeNonEssentialTags(msg.content),
+        }));
+
+        let chatMessages: ModelMessage[] = [
           ...codebasePrefix,
-          ...limitedMessageHistory.map((msg) => ({
-            role: msg.role as "user" | "assistant" | "system",
-            // Why remove thinking tags?
-            // Thinking tags are generally not critical for the context
-            // and eats up extra tokens.
-            content:
-              settings.selectedChatMode === "ask"
-                ? removeDyadTags(removeNonEssentialTags(msg.content))
-                : removeNonEssentialTags(msg.content),
-          })),
+          ...otherCodebasePrefix,
+          ...limitedHistoryChatMessages,
         ];
 
         // Check if the last message should include attachments
@@ -568,16 +692,22 @@ This conversation includes one or more image attachments. When the user uploads 
               content:
                 "Summarize the following chat: " +
                 formatMessagesForSummary(previousChat?.messages ?? []),
-            } satisfies CoreMessage,
+            } satisfies ModelMessage,
           ];
         }
 
         const simpleStreamText = async ({
           chatMessages,
           modelClient,
+          tools,
+          systemPromptOverride = systemPrompt,
+          dyadDisableFiles = false,
         }: {
-          chatMessages: CoreMessage[];
+          chatMessages: ModelMessage[];
           modelClient: ModelClient;
+          tools?: ToolSet;
+          systemPromptOverride?: string;
+          dyadDisableFiles?: boolean;
         }) => {
           const dyadRequestId = uuidv4();
           if (isEngineEnabled) {
@@ -588,26 +718,69 @@ This conversation includes one or more image attachments. When the user uploads 
           } else {
             logger.log("sending AI request");
           }
+          // Build provider options with correct Google/Vertex thinking config gating
+          const providerOptions: Record<string, any> = {
+            "dyad-engine": {
+              dyadRequestId,
+              dyadDisableFiles,
+              dyadMentionedApps: mentionedAppsCodebases.map(
+                ({ files, appName }) => ({
+                  appName,
+                  files,
+                }),
+              ),
+            },
+            "dyad-gateway": getExtraProviderOptions(
+              modelClient.builtinProviderId,
+              settings,
+            ),
+            openai: {
+              reasoningSummary: "auto",
+            } satisfies OpenAIResponsesProviderOptions,
+          };
+
+          // Conditionally include Google thinking config only for supported models
+          const selectedModelName = settings.selectedModel.name || "";
+          const providerId = modelClient.builtinProviderId;
+          const isVertex = providerId === "vertex";
+          const isGoogle = providerId === "google";
+          const isAnthropic = providerId === "anthropic";
+          const isPartnerModel = selectedModelName.includes("/");
+          const isGeminiModel = selectedModelName.startsWith("gemini");
+          const isFlashLite = selectedModelName.includes("flash-lite");
+
+          // Keep Google provider behavior unchanged: always include includeThoughts
+          if (isGoogle) {
+            providerOptions.google = {
+              thinkingConfig: {
+                includeThoughts: true,
+              },
+            } satisfies GoogleGenerativeAIProviderOptions;
+          }
+
+          // Vertex-specific fix: only enable thinking on supported Gemini models
+          if (isVertex && isGeminiModel && !isFlashLite && !isPartnerModel) {
+            providerOptions.google = {
+              thinkingConfig: {
+                includeThoughts: true,
+              },
+            } satisfies GoogleGenerativeAIProviderOptions;
+          }
+
           return streamText({
-            maxTokens: await getMaxTokens(settings.selectedModel),
-            temperature: 0,
+            headers: isAnthropic
+              ? {
+                  "anthropic-beta": "context-1m-2025-08-07",
+                }
+              : undefined,
+            maxOutputTokens: await getMaxTokens(settings.selectedModel),
+            temperature: await getTemperature(settings.selectedModel),
             maxRetries: 2,
             model: modelClient.model,
-            providerOptions: {
-              "dyad-engine": {
-                dyadRequestId,
-              },
-              "dyad-gateway": getExtraProviderOptions(
-                modelClient.builtinProviderId,
-                settings,
-              ),
-              google: {
-                thinkingConfig: {
-                  includeThoughts: true,
-                },
-              } satisfies GoogleGenerativeAIProviderOptions,
-            },
-            system: systemPrompt,
+            stopWhen: [stepCountIs(3), hasToolCall("edit-code")],
+            providerOptions,
+            system: systemPromptOverride,
+            tools,
             messages: chatMessages.filter((m) => m.content),
             onError: (error: any) => {
               logger.error("Error streaming text:", error);
@@ -668,6 +841,46 @@ This conversation includes one or more image attachments. When the user uploads 
           return fullResponse;
         };
 
+        if (settings.selectedChatMode === "agent") {
+          const tools = await getMcpTools(event);
+
+          const { fullStream } = await simpleStreamText({
+            chatMessages: limitedHistoryChatMessages,
+            modelClient,
+            tools: {
+              ...tools,
+              "generate-code": {
+                description:
+                  "ALWAYS use this tool whenever generating or editing code for the codebase.",
+                inputSchema: z.object({}),
+                execute: async () => "",
+              },
+            },
+            systemPromptOverride: constructSystemPrompt({
+              aiRules: await readAiRules(getDyadAppPath(updatedChat.app.path)),
+              chatMode: "agent",
+            }),
+            dyadDisableFiles: true,
+          });
+
+          const result = await processStreamChunks({
+            fullStream,
+            fullResponse,
+            abortController,
+            chatId: req.chatId,
+            processResponseChunkUpdate,
+          });
+          fullResponse = result.fullResponse;
+          chatMessages.push({
+            role: "assistant",
+            content: fullResponse,
+          });
+          chatMessages.push({
+            role: "user",
+            content: "OK.",
+          });
+        }
+
         // When calling streamText, the messages need to be properly formatted for mixed content
         const { fullStream } = await simpleStreamText({
           chatMessages,
@@ -716,7 +929,7 @@ This conversation includes one or more image attachments. When the user uploads 
                   break;
                 }
                 if (part.type !== "text-delta") continue; // ignore reasoning for continuation
-                fullResponse += part.textDelta;
+                fullResponse += part.text;
                 fullResponse = cleanFullResponse(fullResponse);
                 fullResponse = await processResponseChunkUpdate({
                   fullResponse,
@@ -743,7 +956,7 @@ This conversation includes one or more image attachments. When the user uploads 
 
               let autoFixAttempts = 0;
               const originalFullResponse = fullResponse;
-              const previousAttempts: CoreMessage[] = [];
+              const previousAttempts: ModelMessage[] = [];
               while (
                 problemReport.problems.length > 0 &&
                 autoFixAttempts < 2 &&
@@ -1079,9 +1292,9 @@ async function replaceTextAttachmentWithContent(
 
 // Helper function to convert traditional message to one with proper image attachments
 async function prepareMessageWithAttachments(
-  message: CoreMessage,
+  message: ModelMessage,
   attachmentPaths: string[],
-): Promise<CoreMessage> {
+): Promise<ModelMessage> {
   let textContent = message.content;
   // Get the original text content
   if (typeof textContent !== "string") {
@@ -1193,4 +1406,59 @@ function escapeDyadTags(text: string): string {
 const CODEBASE_PROMPT_PREFIX = "This is my codebase.";
 function createCodebasePrompt(codebaseInfo: string): string {
   return `${CODEBASE_PROMPT_PREFIX} ${codebaseInfo}`;
+}
+
+function createOtherAppsCodebasePrompt(otherAppsCodebaseInfo: string): string {
+  return `
+# Referenced Apps
+
+These are the other apps that I've mentioned in my prompt. These other apps' codebases are READ-ONLY.
+
+${otherAppsCodebaseInfo}
+`;
+}
+
+async function getMcpTools(event: IpcMainInvokeEvent): Promise<ToolSet> {
+  const mcpToolSet: ToolSet = {};
+  try {
+    const servers = await db
+      .select()
+      .from(mcpServers)
+      .where(eq(mcpServers.enabled, true as any));
+    for (const s of servers) {
+      const client = await mcpManager.getClient(s.id);
+      const toolSet = await client.tools();
+      for (const [name, tool] of Object.entries(toolSet)) {
+        const key = `${String(s.name || "").replace(/[^a-zA-Z0-9_-]/g, "-")}__${String(name).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+        const original = tool;
+        mcpToolSet[key] = {
+          description: original?.description,
+          inputSchema: original?.inputSchema,
+          execute: async (args: any, execCtx: any) => {
+            const inputPreview =
+              typeof args === "string"
+                ? args
+                : Array.isArray(args)
+                  ? args.join(" ")
+                  : JSON.stringify(args).slice(0, 500);
+            const ok = await requireMcpToolConsent(event, {
+              serverId: s.id,
+              serverName: s.name,
+              toolName: name,
+              toolDescription: original?.description,
+              inputPreview,
+            });
+
+            if (!ok) throw new Error(`User declined running tool ${key}`);
+            const res = await original.execute?.(args, execCtx);
+
+            return typeof res === "string" ? res : JSON.stringify(res);
+          },
+        };
+      }
+    }
+  } catch (e) {
+    logger.warn("Failed building MCP toolset", e);
+  }
+  return mcpToolSet;
 }

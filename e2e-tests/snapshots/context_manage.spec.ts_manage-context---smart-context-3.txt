@@ -31,7 +31,7 @@
       "files": [
         {
           "path": "src/components/ui/helper.ts",
-          "content": "// File contents excluded from context",
+          "content": "// helper.ts\n",
           "force": false
         },
         {
@@ -56,7 +56,8 @@
         }
       ],
       "enable_lazy_edits": true,
-      "enable_smart_files_context": false
+      "enable_smart_files_context": false,
+      "smart_context_mode": "balanced"
     }
   },
   "headers": {
